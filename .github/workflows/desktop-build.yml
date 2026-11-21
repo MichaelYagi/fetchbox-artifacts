@@ -1,0 +1,183 @@
+name: Build desktop apps
+
+# Builds the unsigned Windows 10/11 .exe, the macOS Apple Silicon and Intel .apps and
+# the Linux (x86_64) command-line binary for a tag of the public
+# MichaelYagi/fetchbox repo, smoke-tests each one, and publishes them together as a
+# GitHub Release of *this* private repo: a release of a public repo is downloadable by
+# any signed-in GitHub user, a release of a private one isn't.
+#
+# Every build ships with LICENSE.txt and THIRD-PARTY-NOTICES.txt (generated from what's
+# actually inside it: packaging/gen_third_party_notices.py in the public repo), because
+# the bundled libraries' licenses require their notices to travel with the copies.
+#
+# Triggered:
+#   - automatically: the public repo's notify-desktop.yml sends a repository_dispatch
+#     (event "public-tag") when a vX.Y.Z tag is pushed there
+#   - by hand: gh workflow run desktop-build.yml -R MichaelYagi/fetchbox-artifacts -f tag=v0.1.0
+#     A test build of a branch (nothing published):
+#     gh workflow run desktop-build.yml -R MichaelYagi/fetchbox-artifacts -f tag=main -f publish=false
+#
+# No secrets needed while fetchbox is public (checkout uses this workflow's own token).
+on:
+  repository_dispatch:
+    types: [public-tag]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of MichaelYagi/fetchbox to build (vX.Y.Z); with publish off, any branch"
+        required: true
+        type: string
+      publish:
+        description: "Publish a Release here (only for vX.Y.Z tags)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+  PUBLISH: ${{ github.event_name == 'repository_dispatch' || inputs.publish }}
+  PYTHON: "3.12"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      # The tag arrives from an API payload: refuse anything odd before it reaches a
+      # checkout ref, an artifact name or a shell.
+      - name: Check the ref
+        id: v
+        run: |
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          elif [[ "$PUBLISH" != "true" && "$TAG" =~ ^[A-Za-z0-9._/-]{1,100}$ ]]; then
+            echo "version=" >> "$GITHUB_OUTPUT"   # a branch test build: version not checked
+          else
+            echo "::error::'$TAG' isn't a vX.Y.Z tag (a branch only builds with publish off)"
+            exit 1
+          fi
+          echo "Building $TAG (publish: $PUBLISH)"
+
+  tests:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MichaelYagi/fetchbox
+          ref: ${{ env.TAG }}
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --python ${{ env.PYTHON }}
+      - run: uv run pytest -q
+
+  build:
+    name: ${{ matrix.label }}
+    needs: [validate, tests]
+    # Built natively on each architecture (no cross-compiling, no universal2: not every
+    # compiled dependency ships universal2 wheels). macos-15-intel is GitHub's last Intel
+    # runner image (until about August 2027).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: macOS Silicon, runner: macos-15, os: macos, arch: arm64, asset: Fetchbox-macOS-Silicon }
+          - { label: macOS Intel, runner: macos-15-intel, os: macos, arch: x86_64, asset: Fetchbox-macOS-Intel }
+          - { label: Windows 10-11, runner: windows-latest, os: windows, arch: x64, asset: Fetchbox-Windows-10-11 }
+          - { label: Linux x86_64, runner: ubuntu-latest, os: linux, arch: x86_64, asset: Fetchbox-Linux-x86_64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MichaelYagi/fetchbox
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build
+        run: |
+          case "${{ matrix.os }}" in
+            macos)   PYTHON=python packaging/build-macos.sh ;;
+            linux)   PYTHON=python packaging/build-linux.sh ;;
+            windows) pwsh -File packaging/build-windows.ps1 ;;
+          esac
+      - name: Locate the program
+        id: exe
+        run: |
+          case "${{ matrix.os }}" in
+            macos)   echo "path=dist/Fetchbox.app/Contents/MacOS/Fetchbox" >> "$GITHUB_OUTPUT" ;;
+            linux)   echo "path=dist/fetchbox" >> "$GITHUB_OUTPUT" ;;
+            windows) echo "path=dist/Fetchbox.exe" >> "$GITHUB_OUTPUT" ;;
+          esac
+          PY=.venv-build/bin/python; [ -f .venv-build/Scripts/python.exe ] && PY=.venv-build/Scripts/python.exe
+          echo "python=$PY" >> "$GITHUB_OUTPUT"
+      # PyInstaller builds for the runner's architecture, so a wrong runner label would
+      # ship the wrong build under the right name. Fail instead.
+      - name: Check the architecture
+        if: matrix.os == 'macos'
+        run: |
+          got="$(lipo -archs "${{ steps.exe.outputs.path }}")"
+          echo "built: $got"
+          [[ "$got" == "${{ matrix.arch }}" ]] || { echo "::error::expected ${{ matrix.arch }}, built $got"; exit 1; }
+      - name: Smoke test (scratch data folder; must answer and report the version)
+        run: |
+          "${{ steps.exe.outputs.python }}" packaging/smoke_test.py "${{ steps.exe.outputs.path }}" \
+            "${{ needs.validate.outputs.version || 'any' }}"
+      - name: Add the README, LICENSE and third-party notices
+        run: |
+          DESKTOP=""; [[ "${{ matrix.os }}" != linux ]] && DESKTOP="--desktop"
+          { echo "Fetchbox $TAG -- ${{ matrix.label }}"; echo; cat "packaging/README-${{ matrix.os }}-artifact.txt"; } > dist/README.txt
+          cp LICENSE dist/LICENSE.txt
+          "${{ steps.exe.outputs.python }}" packaging/gen_third_party_notices.py dist/THIRD-PARTY-NOTICES.txt $DESKTOP
+      # One packaged file per platform: a raw directory upload can lose the Unix
+      # executable bit. This file *is* the release asset.
+      - name: Package
+        run: |
+          NAME="${{ matrix.asset }}-${TAG//\//-}"
+          case "${{ matrix.os }}" in
+            linux)   tar -czf "$NAME.tar.gz" -C dist . ;;
+            macos)   (cd dist && zip -qry "../$NAME.zip" .) ;;
+            windows) (cd dist && 7z a -tzip "../$NAME.zip" . > /dev/null) ;;
+          esac
+          ls -la "$NAME".*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}-*
+          retention-days: 30
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build
+    if: github.event_name == 'repository_dispatch' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloads
+          merge-multiple: true
+      - run: ls -la downloads
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Fetchbox ${{ env.TAG }}
+          body: |
+            Desktop builds of [Fetchbox ${{ env.TAG }}](https://github.com/MichaelYagi/fetchbox/releases/tag/${{ env.TAG }}), unsigned. Each archive has a README.txt (how to get past Gatekeeper / SmartScreen), LICENSE.txt and THIRD-PARTY-NOTICES.txt.
+          files: |
+            downloads/*.zip
+            downloads/*.tar.gz
