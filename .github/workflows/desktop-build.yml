@@ -212,7 +212,8 @@ jobs:
               "$PY" packaging/smoke_test.py "$APP/Fetchbox.exe" "$WANT"
               # The tray's update: the same installer, silently, over the installed copy,
               # and Fetchbox must start again afterwards
-              "./$NAME-Setup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /RELAUNCH=1
+              "./$NAME-Setup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /FORCECLOSEAPPLICATIONS \
+                /RELAUNCH=1 /LOG=update.log || { cat update.log; exit 1; }
               for i in $(seq 1 30); do tasklist /FI "IMAGENAME eq Fetchbox.exe" | grep -qi fetchbox.exe && break; sleep 1; done
               tasklist /FI "IMAGENAME eq Fetchbox.exe" | grep -qi fetchbox.exe || { echo "::error::not started again after the update"; exit 1; }
               taskkill /F /T /IM Fetchbox.exe > /dev/null
