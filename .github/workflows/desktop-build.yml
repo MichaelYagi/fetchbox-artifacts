@@ -1,10 +1,10 @@
 name: Build desktop apps
 
 # Builds the unsigned Windows 10/11 installer and .exe, the macOS Apple Silicon and
-# Intel disk images and the Linux (x86_64) .deb, AppImage and binary for a tag of the public
-# MichaelYagi/fetchbox repo, smoke-tests each one, and publishes them together as a
-# GitHub Release of *this* private repo: a release of a public repo is downloadable by
-# any signed-in GitHub user, a release of a private one isn't.
+# Intel disk images and the Linux (x86_64) .deb, AppImage and binary for a tag of the
+# public MichaelYagi/fetchbox repo, tests each build and installer (including the tray's
+# update path), and adds them to that tag's release *in the public repo*, with
+# SHA256SUMS-desktop.txt. The build itself stays here, in a private repo.
 #
 # Every build ships with LICENSE.txt and THIRD-PARTY-NOTICES.txt (generated from what's
 # actually inside it: packaging/gen_third_party_notices.py in the public repo), because
@@ -17,7 +17,7 @@ name: Build desktop apps
 #     A test build of a branch (nothing published):
 #     gh workflow run desktop-build.yml -R MichaelYagi/fetchbox-artifacts -f tag=main -f publish=false
 #
-# No secrets needed while fetchbox is public (checkout uses this workflow's own token).
+# Secrets: FETCHBOX_RELEASE_TOKEN, only to publish (see the publish-release job).
 on:
   repository_dispatch:
     types: [public-tag]
@@ -194,7 +194,14 @@ jobs:
               hdiutil attach -nobrowse -readonly -mountpoint /tmp/fbdmg "$NAME.dmg" > /dev/null
               test -L /tmp/fbdmg/Applications
               "$PY" packaging/smoke_test.py /tmp/fbdmg/Fetchbox.app/Contents/MacOS/Fetchbox "$WANT"
-              hdiutil detach /tmp/fbdmg > /dev/null ;;
+              # The tray's update: its script swaps an installed app for the image's
+              mkdir -p "/tmp/my apps" && ditto /tmp/fbdmg/Fetchbox.app "/tmp/my apps/Fetchbox.app"
+              touch "/tmp/my apps/Fetchbox.app/OLD-COPY"
+              hdiutil detach /tmp/fbdmg > /dev/null
+              cp "$NAME.dmg" /tmp/update.dmg   # the script deletes the image it used
+              "$PY" -c "import subprocess; from pathlib import Path; from fetchbox import updater; s = updater.macos_script(Path('/tmp/update.dmg'), Path('/tmp/my apps/Fetchbox.app'), wait_pid=999999, relaunch=False); subprocess.run(['/bin/sh', str(s)], check=True)"
+              if [ -e "/tmp/my apps/Fetchbox.app/OLD-COPY" ]; then echo "::error::the app wasn't replaced"; exit 1; fi
+              "$PY" packaging/smoke_test.py "/tmp/my apps/Fetchbox.app/Contents/MacOS/Fetchbox" "$WANT" ;;
             windows)
               APP="$LOCALAPPDATA/Programs/Fetchbox"
               "./$NAME-Setup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /TASKS=startup /LOG=setup.log \
@@ -203,6 +210,12 @@ jobs:
               test -f "$APPDATA/Microsoft/Windows/Start Menu/Programs/Fetchbox.lnk"
               reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' /v Fetchbox
               "$PY" packaging/smoke_test.py "$APP/Fetchbox.exe" "$WANT"
+              # The tray's update: the same installer, silently, over the installed copy,
+              # and Fetchbox must start again afterwards
+              "./$NAME-Setup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /RELAUNCH=1
+              for i in $(seq 1 30); do tasklist /FI "IMAGENAME eq Fetchbox.exe" | grep -qi fetchbox.exe && break; sleep 1; done
+              tasklist /FI "IMAGENAME eq Fetchbox.exe" | grep -qi fetchbox.exe || { echo "::error::not started again after the update"; exit 1; }
+              taskkill /F /T /IM Fetchbox.exe > /dev/null
               "$APP/unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
               # the uninstaller hands over to a copy of itself and returns at once
               for i in $(seq 1 60); do [ -e "$APP/Fetchbox.exe" ] || break; sleep 1; done
@@ -218,35 +231,52 @@ jobs:
           path: ${{ matrix.asset }}-*
           retention-days: 30
 
+  # The desktop files go on the public repo's release for the tag (made by its own
+  # release.yml once its tests pass), with a checksum list the tray's updater checks.
+  # Needs FETCHBOX_RELEASE_TOKEN here: a fine-grained token with "Contents: Read and
+  # write" on MichaelYagi/fetchbox (the same token as the public repo's
+  # DESKTOP_DISPATCH_TOKEN, which covers both repos).
   publish-release:
-    name: Publish GitHub Release
+    name: Publish to the public release
     needs: build
     if: github.event_name == 'repository_dispatch' || inputs.publish
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 45
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: downloads
           merge-multiple: true
-      - run: ls -la downloads
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG }}
-          name: Fetchbox ${{ env.TAG }}
-          body: |
-            Desktop builds of [Fetchbox ${{ env.TAG }}](https://github.com/MichaelYagi/fetchbox/releases/tag/${{ env.TAG }}), unsigned.
-
-            - **Windows 10/11:** `-Setup.exe` installs for your user (no administrator needed); the `.zip` runs without installing.
-            - **macOS:** open the `.dmg` for your Mac (Apple Silicon or Intel) and drag Fetchbox to Applications.
-            - **Linux x86_64:** the `.deb` installs a service (Debian, Ubuntu); the `.AppImage` runs on any distribution; the `.tar.gz` is the plain program.
-
-            Each comes with a README (including how to get past Gatekeeper / SmartScreen), LICENSE and THIRD-PARTY-NOTICES.
-          files: |
-            downloads/*.zip
-            downloads/*.tar.gz
-            downloads/*.dmg
-            downloads/*-Setup.exe
-            downloads/*.deb
-            downloads/*.AppImage
+      - name: Checksums
+        run: |
+          cd downloads
+          sha256sum -- * > SHA256SUMS-desktop.txt
+          cat SHA256SUMS-desktop.txt
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ secrets.FETCHBOX_RELEASE_TOKEN }}
+          REPO: MichaelYagi/fetchbox
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::FETCHBOX_RELEASE_TOKEN isn't set in this repo"; exit 1
+          fi
+          for i in $(seq 1 60); do
+            gh release view "$TAG" -R "$REPO" > /dev/null 2>&1 && break
+            echo "waiting for the public release $TAG ($i)"; sleep 30
+          done
+          gh release view "$TAG" -R "$REPO" > /dev/null || { echo "::error::no public release $TAG"; exit 1; }
+          gh release upload "$TAG" downloads/* -R "$REPO" --clobber
+          notes="$(gh release view "$TAG" -R "$REPO" --json body -q .body)"
+          if ! grep -q "## Desktop downloads" <<< "$notes"; then
+            {
+              printf '%s\n\n## Desktop downloads\n\n' "$notes"
+              echo "Unsigned; each comes with a README (getting past SmartScreen / Gatekeeper), LICENSE and THIRD-PARTY-NOTICES."
+              echo
+              echo '- **Windows 10/11:** `-Setup.exe` installs for your user (no administrator needed); the `.zip` runs without installing.'
+              echo '- **macOS:** the `.dmg` for your Mac (Apple Silicon or Intel); drag Fetchbox to Applications.'
+              echo '- **Linux x86_64:** the `.deb` installs a service (Debian, Ubuntu); the `.AppImage` runs anywhere; the `.tar.gz` is the plain program.'
+              echo
+              echo 'Installed copies on Windows and macOS update themselves from the tray menu. `SHA256SUMS-desktop.txt` lists the checksums.'
+            } > notes.md
+            gh release edit "$TAG" -R "$REPO" --notes-file notes.md
+          fi
