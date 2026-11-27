@@ -1,9 +1,9 @@
 # fetchbox-artifacts
 
-Private. Builds the Windows `.exe`, macOS `.app`s (Apple Silicon and Intel) and the
-Linux binary for tags of the public [fetchbox](https://github.com/MichaelYagi/fetchbox)
-repo, and publishes them as a **GitHub Release of this repo**. That way they aren't
-downloadable by anyone with a GitHub account, as a public repo's releases would be.
+Builds the desktop apps (the Windows installer and `.exe`, macOS disk images for Apple
+Silicon and Intel, and the Linux `.deb`, AppImage and binary) for tags of
+[fetchbox](https://github.com/MichaelYagi/fetchbox), tests them, and adds them to that
+tag's release in the fetchbox repo. Public, so its GitHub Actions minutes are free.
 
 - Runs automatically when the public repo's `notify-desktop.yml` sends a `public-tag`
   dispatch. That needs `DESKTOP_DISPATCH_TOKEN` set as a secret *there*: a fine-grained
@@ -13,7 +13,8 @@ downloadable by anyone with a GitHub account, as a public repo's releases would 
 - Test-build a branch without publishing anything:
   `gh workflow run desktop-build.yml -R MichaelYagi/fetchbox-artifacts -f tag=main -f publish=false`
   (the builds are kept as workflow artifacts for 30 days).
-- No secrets here while fetchbox is public.
+- `FETCHBOX_RELEASE_TOKEN` is set here, to publish to fetchbox's release: GitHub keeps
+  it hidden, in logs too, and the workflow can only be run by the repo's owner.
 
 ## What a release contains
 
