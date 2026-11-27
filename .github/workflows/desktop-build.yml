@@ -4,7 +4,7 @@ name: Build desktop apps
 # Intel disk images and the Linux (x86_64) .deb, AppImage and binary for a tag of the
 # public MichaelYagi/fetchbox repo, tests each build and installer (including the tray's
 # update path), and adds them to that tag's release *in the public repo*, with
-# SHA256SUMS-desktop.txt. The build itself stays here, in a private repo.
+# SHA256SUMS-desktop.txt. The build itself runs here (a public repo: free Actions minutes).
 #
 # Every build ships with LICENSE.txt and THIRD-PARTY-NOTICES.txt (generated from what's
 # actually inside it: packaging/gen_third_party_notices.py in the public repo), because
